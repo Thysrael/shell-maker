@@ -4,7 +4,7 @@
 
 ;; Author: Alvaro Ramirez https://xenodium.com
 ;; URL: https://github.com/xenodium/shell-maker
-;; Version: 0.71.1
+;; Version: 0.75.1
 ;; Package-Requires: ((emacs "27.1"))
 
 ;; This package is free software; you can redistribute it and/or modify
@@ -372,9 +372,9 @@ Of the form:
   "Clear the current shell buffer."
   (interactive)
   (when shell-maker-forget-file-after-clear
-
     (setq shell-maker--file nil))
-  (comint-clear-buffer))
+  (when (shell-maker--process)
+    (comint-clear-buffer)))
 
 (defun shell-maker-search-history ()
   "Search previous input history."
@@ -672,11 +672,16 @@ Return t if INPUT us cleared.  nil otherwise."
             shell-maker--config)
            (funcall (shell-maker-config-validate-command
                      shell-maker--config) input))
-      (shell-maker--write-reply shell-maker--config
-                                (concat "\n"
-                                        (funcall (shell-maker-config-validate-command
-                                                  shell-maker--config) input)
-                                        "\n\n"))
+      (let ((error (concat "\n"
+                           (funcall (shell-maker-config-validate-command
+                                     shell-maker--config) input)
+                           "\n\n")))
+        (shell-maker--write-reply shell-maker--config error)
+        (shell-maker--notify-on-command-finished
+         :config shell-maker--config
+         :input input
+         :output error
+         :success nil))
       (setq shell-maker--busy nil)
       nil)
      ((string-empty-p (string-trim input))
@@ -817,7 +822,7 @@ LOG: A function to log to.
                                 (log "%s" raw-output)
                                 (setq output (concat output raw-output))
                                 (when on-output
-                                  (funcall on-output (concat "\n" (string-trim raw-output)))))
+                                  (funcall on-output (string-trim raw-output))))
                       :sentinel (lambda (process _event)
                                   (kill-buffer (process-buffer process))))
              :sentinel (lambda (process _event)
@@ -835,7 +840,7 @@ LOG: A function to log to.
                               (funcall on-output (format "\n\n%s" err))))))))
       shell-maker--request-process)))
 
-(cl-defun shell-maker-make-http-request (&key async url data encoding timeout
+(cl-defun shell-maker-make-http-request (&key async url data encoding timeout proxy
                                               headers fields filter on-output on-finished shell)
   "Make HTTP request at URL.
 
@@ -875,7 +880,8 @@ ON-FINISHED: (lambda (result))."
                                                           :encoding encoding
                                                           :timeout timeout
                                                           :headers headers
-                                                          :fields fields)
+                                                          :fields fields
+                                                          :proxy proxy)
                  :filter filter
                  :on-output on-output
                  :on-finished on-finished
@@ -886,7 +892,7 @@ ON-FINISHED: (lambda (result))."
        (cons :success (eq (map-elt result :exit-status) 0))
        (cons :output (map-elt result :output))))))
 
-(cl-defun shell-maker-make--curl-command (&key url data encoding timeout headers fields)
+(cl-defun shell-maker-make--curl-command (&key url data encoding timeout headers fields proxy)
   "Build curl command list using URL.
 
 Optionally, add:
@@ -903,6 +909,8 @@ FIELDS: As a list of strings
   (\"field1=value1\")
    \"field2=value2\")
 
+PROXY: Set when needing an http proxy.
+
 and TIMEOUT: defaults to 600ms."
   (unless encoding
     (setq encoding 'utf-8))
@@ -918,6 +926,8 @@ and TIMEOUT: defaults to 600ms."
                   "--fail-with-body"
                   "--no-progress-meter"
                   "-m" (number-to-string timeout))
+            (when proxy
+              (list "--proxy" proxy))
             (apply #'append
                    (mapcar (lambda (header)
                              (list "-H" header))
@@ -1166,8 +1176,7 @@ returned list is of the form:
 
 (defun shell-maker--curl-version-supported ()
   "Return t if curl version is 7.76 or newer, nil otherwise."
-  (let* ((curl-error-redirect (if (eq system-type (or 'windows-nt 'ms-dos)) "2> NUL" "2>/dev/null"))
-         (curl-version-string (shell-command-to-string (concat "curl --version " curl-error-redirect))))
+  (let ((curl-version-string (shell-command-to-string (concat "curl --version "))))
     (when (string-match "\\([0-9]+\\.[0-9]+\\.[0-9]+\\)" curl-version-string)
       (let ((version (match-string 1 curl-version-string)))
         (version<= "7.76" version)))))
@@ -1832,22 +1841,30 @@ Of the form:
                                      ;; the shell buffer.
                                      (when on-finished-broadcast
                                        (funcall on-finished-broadcast input full-output success))
-                                     (when (shell-maker-config-on-command-finished config)
-                                       (let* ((params (func-arity (shell-maker-config-on-command-finished config)))
-                                              (params-max (cdr params)))
-                                         (cond ((= params-max 2)
-                                                (funcall (shell-maker-config-on-command-finished config)
-                                                         input
-                                                         full-output))
-                                               ((= params-max 3)
-                                                (funcall (shell-maker-config-on-command-finished config)
-                                                         input
-                                                         full-output
-                                                         success))
-                                               (t
-                                                (message (concat ":on-command-finished expects "
-                                                                 "(lambda (command output)) or "
-                                                                 "(lambda (command output success))"))))))))))))
+                                     (shell-maker--notify-on-command-finished
+                                      :config config
+                                      :input input
+                                      :output full-output
+                                      :success success)))))))
+
+(cl-defun shell-maker--notify-on-command-finished (&key config input output success)
+  "Notify CONFIG's :on-command-finished observer of INPUT, OUTPUT, and SUCCESS."
+  (when (shell-maker-config-on-command-finished config)
+    (let* ((params (func-arity (shell-maker-config-on-command-finished config)))
+           (params-max (cdr params)))
+      (cond ((= params-max 2)
+             (funcall (shell-maker-config-on-command-finished config)
+                      input
+                      output))
+            ((= params-max 3)
+             (funcall (shell-maker-config-on-command-finished config)
+                      input
+                      output
+                      success))
+            (t
+             (message (concat ":on-command-finished expects "
+                              "(lambda (command output)) or "
+                              "(lambda (command output success))")))))))
 
 ;; TODO: Remove in favor of shell-maker--eval-input-on-buffer-v2.
 (cl-defun shell-maker--eval-input-on-buffer-v1 (&key input config on-output no-announcement)
